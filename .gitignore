@@ -1,13 +1,15 @@
-# secrets
+# secrets and login material
 .env
+webhook.env
 credentials.json
 *secrets*.json
 verify_code.txt
 qr.png
 qr.tmp.png
 qr_url.txt
+qr_session.json
 
-# runtime state (contains message text, user ids, context tokens)
+# runtime state
 state.json
 state.json.tmp
 pending.json
@@ -26,12 +28,17 @@ forward.heartbeat
 # downloaded WeChat media
 attachments/
 
-# old copies
-*.bak
-*.bak.*
-backup-*/
+# local install
+.venv/
+venv/
+wheels/
+SHA256SUMS
 
 # python
 __pycache__/
 *.pyc
-.venv/
+
+# old copies
+*.bak
+*.bak.*
+backup-*/

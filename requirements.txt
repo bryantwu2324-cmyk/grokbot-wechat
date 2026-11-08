@@ -1,2 +1,7 @@
-cryptography>=41      # AES-128-ECB decrypt of WeChat CDN media (media.py)
-qrcode[pil]>=7        # QR rendering for bind.py
+# Local libraries only. The box artifact installs the vendored wheels with
+# pip --no-index. Versions below are the wheels in that artifact.
+cryptography==50.0.2
+cffi==2.1.1
+pycparser==3.12
+pillow==13.0.0
+qrcode==8.2

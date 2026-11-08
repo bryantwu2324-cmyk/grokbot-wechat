@@ -1,80 +1,135 @@
-"""WeChat iLink media: summarise items, download from CDN and AES-128-ECB decrypt (openclaw-weixin convention)."""
-import base64, binascii, os, time, urllib.parse, urllib.request
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+"""Download and decrypt media that the bound user sent.
 
-CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c"
+Downloads stay on official weixin.qq.com hosts. AES keys and CDN query
+parameters are not copied into the webhook payload.
+"""
+import base64, binascii, os, time, urllib.parse
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import config
+import ilink
+
+CDN_BASE = config.CDN_ORIGIN + "/c2c"
 TYPE_NAMES = {1: "text", 2: "image", 3: "voice", 4: "file", 5: "video"}
 ITEM_KEYS = {1: "text_item", 2: "image_item", 3: "voice_item", 4: "file_item", 5: "video_item"}
 
-def _strip_long(d, maxlen=120):
-    if isinstance(d, dict): return {k: _strip_long(v, maxlen) for k, v in d.items()}
-    if isinstance(d, list): return [_strip_long(v, maxlen) for v in d]
-    if isinstance(d, str) and len(d) > maxlen: return d[:maxlen] + "...(%d chars)" % len(d)
-    return d
 
 def summarize(item):
-    t = item.get("type"); name = TYPE_NAMES.get(t, "unknown")
-    s = {"type": t, "type_name": name}
-    if t == 1:
-        s["text"] = (item.get("text_item") or {}).get("text")
-    else:
-        sub = item.get(ITEM_KEYS.get(t, ""), {}) or {}
-        meta = {k: v for k, v in sub.items() if k not in ("media", "thumb_media", "aeskey")}
-        if t == 3 and sub.get("text"): s["text"] = sub["text"]  # voice transcript
-        s["meta"] = _strip_long(meta)
-    return s
+    """Allowlisted fields only. CDN parameters and AES keys are dropped."""
+    if not isinstance(item, dict):
+        return {"type": None, "type_name": "unknown"}
+    kind = item.get("type")
+    summary = {"type": kind, "type_name": TYPE_NAMES.get(kind, "unknown")}
+    sub = item.get(ITEM_KEYS.get(kind, ""), {}) or {}
+    if not isinstance(sub, dict):
+        sub = {}
+    if kind == 1:
+        summary["text"] = sub.get("text")
+    elif kind == 3 and sub.get("text"):
+        summary["text"] = sub.get("text")
+    elif kind == 4 and sub.get("file_name"):
+        summary["file_name"] = os.path.basename(str(sub.get("file_name")))[:200]
+    return summary
+
 
 def parse_key(item_sub):
-    """Return 16-byte AES key. aeskey is hex; media.aes_key is base64 of raw 16 bytes or of the hex string."""
     hx = item_sub.get("aeskey")
     if hx:
         return binascii.unhexlify(hx)
-    b64 = (item_sub.get("media") or {}).get("aes_key")
-    if not b64: raise ValueError("no aes key in item")
-    raw = base64.b64decode(b64)
-    if len(raw) == 16: return raw
-    if len(raw) == 32: return binascii.unhexlify(raw.decode())
-    raise ValueError("unexpected aes_key length %d" % len(raw))
+    encoded = (item_sub.get("media") or {}).get("aes_key")
+    if not encoded:
+        raise ValueError("no aes key")
+    raw = base64.b64decode(encoded)
+    if len(raw) == 16:
+        return raw
+    if len(raw) == 32:
+        return binascii.unhexlify(raw.decode())
+    raise ValueError("unexpected aes key length")
+
 
 def media_url(media):
-    if media.get("full_url"): return media["full_url"]
-    q = media.get("encrypt_query_param")
-    if not q: raise ValueError("no media url / encrypt_query_param")
-    return CDN_BASE + "/download?encrypted_query_param=" + urllib.parse.quote(q, safe="")
+    if not isinstance(media, dict):
+        raise ilink.IlinkError("media missing")
+    if media.get("full_url"):
+        return ilink.validate_cdn_url(media["full_url"])
+    query = media.get("encrypt_query_param")
+    if not query:
+        raise ilink.IlinkError("media url missing")
+    return ilink.validate_cdn_url(
+        CDN_BASE + "/download?encrypted_query_param=" + urllib.parse.quote(str(query), safe="")
+    )
+
 
 def download(url, timeout=60):
-    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=timeout) as f:
-        return f.read()
+    safe = ilink.validate_cdn_url(url)
+    status, payload = ilink.request(
+        safe, method="GET",
+        headers={"User-Agent": config.BOT_AGENT},
+        timeout=timeout, redirects="cdn",
+    )
+    if status != 200:
+        raise ilink.IlinkError("media http %s" % status)
+    return payload
+
 
 def decrypt(data, key):
-    d = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
-    out = d.update(data) + d.finalize()
+    dec = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+    out = dec.update(data) + dec.finalize()
     pad = out[-1] if out else 0
-    if 1 <= pad <= 16 and out.endswith(bytes([pad]) * pad): out = out[:-pad]
+    if 1 <= pad <= 16 and out.endswith(bytes([pad]) * pad):
+        out = out[:-pad]
     return out
 
-MAGIC = [(b"\xff\xd8\xff", "jpg"), (b"\x89PNG", "png"), (b"GIF8", "gif"), (b"RIFF", "webp"), (b"%PDF", "pdf"),
-         (b"PK\x03\x04", "zip"), (b"#!AMR", "amr"), (b"\x02#!SILK", "silk"), (b"#!SILK", "silk")]
+
+MAGIC = (
+    (b"\xff\xd8\xff", "jpg"), (b"\x89PNG", "png"), (b"GIF8", "gif"), (b"RIFF", "webp"),
+    (b"%PDF", "pdf"), (b"PK\x03\x04", "zip"), (b"#!AMR", "amr"), (b"\x02#!SILK", "silk"),
+    (b"#!SILK", "silk"),
+)
+
+
 def sniff_ext(data, default="bin"):
-    for m, e in MAGIC:
-        if data.startswith(m): return e
-    if data[4:8] == b"ftyp": return "mp4"
+    for magic, ext in MAGIC:
+        if data.startswith(magic):
+            return ext
+    if len(data) >= 8 and data[4:8] == b"ftyp":
+        return "mp4"
     return default
 
+
+def _safe_ext(name, fallback):
+    cleaned = "".join(ch for ch in str(name or "") if ch.isalnum())[:8]
+    return cleaned or fallback
+
+
 def fetch_item(item, outdir, ts=None):
-    """Download+decrypt an image/file/voice/video item. Returns absolute saved path."""
-    t = item.get("type"); name = TYPE_NAMES.get(t, "media")
-    sub = item.get(ITEM_KEYS.get(t, ""), {}) or {}
+    kind = item.get("type")
+    name = TYPE_NAMES.get(kind, "media")
+    sub = item.get(ITEM_KEYS.get(kind, ""), {}) or {}
+    if not isinstance(sub, dict):
+        raise ilink.IlinkError("media item missing")
     media = sub.get("media") or {}
-    plain = decrypt(download(media_url(media)), parse_key(sub))
+    try:
+        key = parse_key(sub)
+    except ValueError:
+        key = None
+    if key is None and kind != 2:
+        raise ilink.IlinkError("media key missing")
+    blob = download(media_url(media))
+    plain = decrypt(blob, key) if key is not None else blob
     ext = None
-    if t == 4 and sub.get("file_name") and "." in sub["file_name"]:
-        ext = sub["file_name"].rsplit(".", 1)[1][:8]
+    if kind == 4 and sub.get("file_name") and "." in str(sub.get("file_name")):
+        ext = _safe_ext(str(sub["file_name"]).rsplit(".", 1)[1], "")
     ext = ext or sniff_ext(plain)
     os.makedirs(outdir, exist_ok=True)
+    os.chmod(outdir, 0o700)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(ts or time.time()))
-    path = os.path.join(outdir, "%s-%s.%s" % (stamp, name, ext)); n = 1
+    path = os.path.join(outdir, "%s-%s.%s" % (stamp, name, ext))
+    n = 1
     while os.path.exists(path):
-        path = os.path.join(outdir, "%s-%s-%d.%s" % (stamp, name, n, ext)); n += 1
-    with open(path, "wb") as f: f.write(plain)
+        path = os.path.join(outdir, "%s-%s-%d.%s" % (stamp, name, n, ext))
+        n += 1
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(plain)
+    os.chmod(path, 0o600)
     return os.path.abspath(path)
