@@ -1,26 +1,90 @@
 #!/usr/bin/env python3
-"""Send a text to the bound WeChat user. This is what the agent calls to reply.
-Usage: python3 send.py "text" [--to USER_ID] [--no-context] [--app] [--reply-to-ms MS]
---reply-to-ms: the trigger_ms of the WeChat batch this reply answers. If the user has sent a newer
-  message since, nothing is sent and the exit code is 4 (SUPERSEDED): the newer run will answer.
---app: prefix APP_PREFIX (default "[grok bot] ") for pushes not triggered by the WeChat webhook
-  (reminders, routine output), so the user can tell them apart from replies.
-If WeChat refuses (the ~24h window since the user's last message has closed), the text is queued in
-outbox.json (exit code 3) and forward.py sends it automatically the next time the user writes.
-Exit codes: 0 sent, 3 queued, 4 superseded."""
-import argparse, sys
-import outbox
-from config import APP_PREFIX, OWNER_NAME
-p = argparse.ArgumentParser(); p.add_argument("text"); p.add_argument("--to"); p.add_argument("--no-context", action="store_true")
-p.add_argument("--app", action="store_true", help="prefix APP_PREFIX for sends not triggered by the WeChat webhook")
-p.add_argument("--reply-to-ms", type=int)
-a = p.parse_args()
-if a.reply_to_ms is not None:
-    last = outbox.last_inbound_s()
-    if last and last * 1000 > a.reply_to_ms + 500:
-        print("SUPERSEDED: %s sent a newer message; not sending. Stop this run without filing anything." % OWNER_NAME)
-        sys.exit(4)
-text = (APP_PREFIX + a.text) if a.app else a.text
-sent, resp = outbox.send_or_queue(text, to=a.to, context_token="" if a.no_context else None)
-print("sent:" if sent else "QUEUED (will auto-send when the user next writes):", resp)
-sys.exit(0 if sent else 3)
+"""Local reply command for the existing Grok Bot boss.
+
+This does not call a model. It sends one text to the bound WeChat user when
+sending has been explicitly enabled. It never chooses a different recipient.
+"""
+import sys
+import history
+import ilink
+import config
+
+
+def run(argv):
+    if "--app" in argv:
+        print("proactive send is disabled")
+        return 2
+    args = [arg for arg in argv if arg != "--no-context"]
+    no_context = "--no-context" in argv
+    reply_to = None
+    text_args = []
+    to_override = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--reply-to-ms" and index + 1 < len(args):
+            try:
+                reply_to = int(args[index + 1])
+            except ValueError:
+                print("reply-to-ms is not an integer")
+                return 2
+            index += 2
+            continue
+        if arg == "--to":
+            to_override = True
+            index += 2
+            continue
+        if arg.startswith("--"):
+            print("unknown argument")
+            return 2
+        text_args.append(arg)
+        index += 1
+    if to_override:
+        print("recipient override is disabled; replies go only to the bound user")
+        return 2
+    text = " ".join(text_args).strip()
+    if not text:
+        print("usage: reply.sh \"text\" --reply-to-ms <trigger_ms>")
+        return 2
+    if not config.send_enabled():
+        print("sending is disabled (WECHAT_SEND_ENABLED is not 1); nothing was sent")
+        return 2
+    if config.data_dir_problem():
+        print(config.data_dir_problem())
+        return 2
+    try:
+        creds = ilink.load_creds()
+    except ilink.IlinkError as exc:
+        print("not sent: %s" % exc)
+        return 2
+    if reply_to is not None:
+        try:
+            state = ilink.load_state()
+        except ilink.IlinkError as exc:
+            print("not sent: %s" % exc)
+            return 2
+        last = state.get("last_inbound_ms") or 0
+        if last and last > reply_to + 500:
+            print("SUPERSEDED: the bound user sent a newer message; nothing was sent")
+            return 4
+    if len(text) > 16000:
+        print("not sent: text is longer than the local 16000 character guard")
+        return 2
+    try:
+        ok, code = ilink.send_text(text, context_token="" if no_context else None)
+    except (ilink.IlinkError, TimeoutError, OSError) as exc:
+        print("not sent: %s" % exc)
+        return 3
+    if not ok:
+        print("not sent: wechat ret=%s; nothing was queued" % code)
+        return 3
+    try:
+        history.append(history.bot_line(text))
+    except OSError:
+        pass
+    print("sent to %s" % ilink.redact(creds["ilink_user_id"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run(sys.argv[1:]))
